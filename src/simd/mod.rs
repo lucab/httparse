@@ -59,7 +59,7 @@ mod runtime;
         target_arch = "x86_64",
     ),
 ))]
-pub use self::runtime::*;
+pub(crate) use self::runtime::*;
 
 #[cfg(all(
     httparse_simd,
