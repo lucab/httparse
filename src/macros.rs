@@ -1,12 +1,21 @@
 //! Utility macros
 
 macro_rules! next {
-    ($bytes:ident) => ({
-        match $bytes.next() {
-            Some(b) => b,
-            None => return Ok(Status::Partial)
+    ($bytes:ident) => {{
+        if $bytes.is_empty() {
+            return Ok(Status::Partial);
         }
-    })
+        $bytes.get_u8()
+    }};
+}
+
+macro_rules! peek {
+    ($bytes:ident) => {{
+        match $bytes.get(0) {
+            None => return Ok(Status::Partial),
+            Some(b) => *b,
+        }
+    }};
 }
 
 macro_rules! expect {
@@ -25,9 +34,9 @@ macro_rules! complete {
     ($e:expr) => {
         match $e? {
             Status::Complete(v) => v,
-            Status::Partial => return Ok(Status::Partial)
+            Status::Partial => return Ok(Status::Partial),
         }
-    }
+    };
 }
 
 macro_rules! byte_map {
@@ -39,7 +48,7 @@ macro_rules! byte_map {
 macro_rules! space {
     ($bytes:ident or $err:expr) => ({
         expect!($bytes.next() == b' ' => Err($err));
-        $bytes.slice();
+        $bytes.advance(1);
     })
 }
 
@@ -48,11 +57,8 @@ macro_rules! newline {
         match next!($bytes) {
             b'\r' => {
                 expect!($bytes.next() == b'\n' => Err(Error::NewLine));
-                $bytes.slice();
             },
-            b'\n' => {
-                $bytes.slice();
-            },
+            b'\n' => { },
             _ => return Err(Error::NewLine)
         }
     })

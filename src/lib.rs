@@ -25,8 +25,11 @@
 //! `-C target_cpu=native` allows the detection to become compile time checks,
 //! making it *even* faster.
 
+use core::convert::TryInto;
 use core::{fmt, result, str};
-use core::mem::{MaybeUninit};
+use core::mem::MaybeUninit;
+
+use bytes::{Buf, BytesMut};
 
 use crate::iter::Bytes;
 
@@ -396,7 +399,9 @@ impl ParserConfig {
         request: &mut Request<'_, 'buf>,
         buf: &'buf [u8],
     ) -> Result<usize> {
-        request.parse_with_config(buf, self)
+        let mut bytes = BytesMut::with_capacity(buf.len());
+        bytes.extend_from_slice(&buf);
+        request.parse_with_config(bytes, self)
     }
 
     /// Parses a request with the given config and buffer for headers
@@ -406,7 +411,9 @@ impl ParserConfig {
         buf: &'buf [u8],
         headers: &'headers mut [MaybeUninit<Header<'buf>>],
     ) -> Result<usize> {
-        request.parse_with_config_and_uninit_headers(buf, self, headers)
+        let mut bytes = BytesMut::with_capacity(buf.len());
+        bytes.extend_from_slice(&buf);
+        request.parse_with_config_and_uninit_headers(bytes, self, headers)
     }
 
     /// Sets whether invalid header lines should be silently ignored in responses.
@@ -527,12 +534,12 @@ impl<'h, 'b> Request<'h, 'b> {
 
     fn parse_with_config_and_uninit_headers(
         &mut self,
-        buf: &'b [u8],
+        bytes: BytesMut,
         config: &ParserConfig,
         mut headers: &'h mut [MaybeUninit<Header<'b>>],
     ) -> Result<usize> {
-        let orig_len = buf.len();
-        let mut bytes = Bytes::new(buf);
+        let orig_len = bytes.len();
+        //let mut bytes = Bytes::new(buf);
         complete!(skip_empty_lines(&mut bytes));
         let method = complete!(parse_method(&mut bytes));
         self.method = Some(method);
@@ -569,13 +576,13 @@ impl<'h, 'b> Request<'h, 'b> {
     /// For more information, see `parse`
     pub fn parse_with_uninit_headers(
         &mut self,
-        buf: &'b [u8],
+        buf: BytesMut,
         headers: &'h mut [MaybeUninit<Header<'b>>],
     ) -> Result<usize> {
         self.parse_with_config_and_uninit_headers(buf, &Default::default(), headers)
     }
 
-    fn parse_with_config(&mut self, buf: &'b [u8], config: &ParserConfig) -> Result<usize> {
+    fn parse_with_config(&mut self, buf: BytesMut, config: &ParserConfig) -> Result<usize> {
         let headers = core::mem::replace(&mut self.headers, &mut []);
 
         /* SAFETY: see `parse_headers_iter_uninit` guarantees */
@@ -597,28 +604,25 @@ impl<'h, 'b> Request<'h, 'b> {
     ///
     /// Returns byte offset in `buf` to start of HTTP body.
     pub fn parse(&mut self, buf: &'b [u8]) -> Result<usize> {
-        self.parse_with_config(buf, &Default::default())
+        let mut bytes = BytesMut::with_capacity(buf.len());
+        bytes.extend_from_slice(&buf);
+        self.parse_with_config(bytes, &Default::default())
     }
 }
 
 #[inline]
-fn skip_empty_lines(bytes: &mut Bytes<'_>) -> Result<()> {
+fn skip_empty_lines(bytes: &mut BytesMut) -> Result<()> {
     loop {
-        let b = bytes.peek();
+        let b = bytes.get(0);
         match b {
             Some(b'\r') => {
-                // SAFETY: peeked and found `\r`, so it's safe to bump 1 pos
-                unsafe { bytes.bump() };
+                bytes.advance(1);
                 expect!(bytes.next() == b'\n' => Err(Error::NewLine));
             }
             Some(b'\n') => {
-                // SAFETY: peeked and found `\n`, so it's safe to bump 1 pos
-                unsafe {
-                    bytes.bump();
-                }
+                bytes.advance(1);
             }
             Some(..) => {
-                bytes.slice();
                 return Ok(Status::Complete(()));
             }
             None => return Ok(Status::Partial),
@@ -627,16 +631,13 @@ fn skip_empty_lines(bytes: &mut Bytes<'_>) -> Result<()> {
 }
 
 #[inline]
-fn skip_spaces(bytes: &mut Bytes<'_>) -> Result<()> {
+fn skip_spaces(bytes: &mut BytesMut) -> Result<()> {
     loop {
-        let b = bytes.peek();
-        match b {
+        match bytes.get(0) {
             Some(b' ') => {
-                // SAFETY: peeked and found ` `, so it's safe to bump 1 pos
-                unsafe { bytes.bump() };
+                bytes.advance(1);
             }
             Some(..) => {
-                bytes.slice();
                 return Ok(Status::Complete(()));
             }
             None => return Ok(Status::Partial),
@@ -675,10 +676,11 @@ impl<'h, 'b> Response<'h, 'b> {
 
     /// Try to parse a buffer of bytes into this `Response`.
     pub fn parse(&mut self, buf: &'b [u8]) -> Result<usize> {
-        self.parse_with_config(buf, &ParserConfig::default())
+        let bytes = BytesMut::from(buf);
+        self.parse_with_config(bytes, &ParserConfig::default())
     }
 
-    fn parse_with_config(&mut self, buf: &'b [u8], config: &ParserConfig) -> Result<usize> {
+    fn parse_with_config(&mut self, buf: BytesMut, config: &ParserConfig) -> Result<usize> {
         let headers = core::mem::replace(&mut self.headers, &mut []);
 
         // SAFETY: see guarantees of [`parse_headers_iter_uninit`], which leaves no uninitialized
@@ -699,12 +701,12 @@ impl<'h, 'b> Response<'h, 'b> {
 
     fn parse_with_config_and_uninit_headers(
         &mut self,
-        buf: &'b [u8],
+        buf: BytesMut,
         config: &ParserConfig,
         mut headers: &'h mut [MaybeUninit<Header<'b>>],
     ) -> Result<usize> {
         let orig_len = buf.len();
-        let mut bytes = Bytes::new(buf);
+        let mut bytes = buf;
 
         complete!(skip_empty_lines(&mut bytes));
         self.version = Some(complete!(parse_version(&mut bytes)));
@@ -728,16 +730,16 @@ impl<'h, 'b> Response<'h, 'b> {
                 if config.allow_multiple_spaces_in_response_status_delimiters {
                     complete!(skip_spaces(&mut bytes));
                 }
-                bytes.slice();
+                bytes.advance(1);
                 self.reason = Some(complete!(parse_reason(&mut bytes)));
             },
             b'\r' => {
                 expect!(bytes.next() == b'\n' => Err(Error::Status));
-                bytes.slice();
+                bytes.advance(1);
                 self.reason = Some("");
             },
             b'\n' => {
-                bytes.slice();
+                bytes.advance(1);
                 self.reason = Some("");
             }
             _ => return Err(Error::Status),
@@ -802,45 +804,43 @@ pub const EMPTY_HEADER: Header<'static> = Header { name: "", value: b"" };
 #[doc(hidden)]
 #[allow(missing_docs)]
 // WARNING: Exported for internal benchmarks, not fit for public consumption
-pub fn parse_version(bytes: &mut Bytes) -> Result<u8> {
-    if let Some(eight) = bytes.peek_n::<[u8; 8]>(8) {
+pub fn parse_version(buf: &mut BytesMut) -> Result<u8> {
+    if buf.len() >= 8 {
+        // NOTE: guaranteed to be within buffer bounds.
+        let eight = buf.split_to(8).freeze().as_ref();
+        let block = u64::from_ne_bytes(eight.try_into().unwrap());
+
         // NOTE: should be const once MSRV >= 1.44
         let h10: u64 = u64::from_ne_bytes(*b"HTTP/1.0");
         let h11: u64 = u64::from_ne_bytes(*b"HTTP/1.1");
-        // SAFETY: peek_n(8) before ensure within bounds
-        unsafe {
-            bytes.advance(8);
-        }
-        let block = u64::from_ne_bytes(eight);
+
         // NOTE: should be match once h10 & h11 are consts
-        return if block == h10 {
+        if block == h10 {
             Ok(Status::Complete(0))
         } else if block == h11 {
             Ok(Status::Complete(1))
         } else {
             Err(Error::Version)
-        };
+        }
+    } else {
+        // If there aren't at least 8 bytes, we still want to detect early
+        // if this is a valid version or not. If it is, we'll return Partial.
+        expect!(buf.next() == b'H' => Err(Error::Version));
+        expect!(buf.next() == b'T' => Err(Error::Version));
+        expect!(buf.next() == b'T' => Err(Error::Version));
+        expect!(buf.next() == b'P' => Err(Error::Version));
+        expect!(buf.next() == b'/' => Err(Error::Version));
+        expect!(buf.next() == b'1' => Err(Error::Version));
+        expect!(buf.next() == b'.' => Err(Error::Version));
+        Ok(Status::Partial)
     }
-
-    // else (but not in `else` because of borrow checker)
-
-    // If there aren't at least 8 bytes, we still want to detect early
-    // if this is a valid version or not. If it is, we'll return Partial.
-    expect!(bytes.next() == b'H' => Err(Error::Version));
-    expect!(bytes.next() == b'T' => Err(Error::Version));
-    expect!(bytes.next() == b'T' => Err(Error::Version));
-    expect!(bytes.next() == b'P' => Err(Error::Version));
-    expect!(bytes.next() == b'/' => Err(Error::Version));
-    expect!(bytes.next() == b'1' => Err(Error::Version));
-    expect!(bytes.next() == b'.' => Err(Error::Version));
-    Ok(Status::Partial)
 }
 
 #[inline]
 #[doc(hidden)]
 #[allow(missing_docs)]
 // WARNING: Exported for internal benchmarks, not fit for public consumption
-pub fn parse_method<'a>(bytes: &mut Bytes<'a>) -> Result<&'a str> {
+pub fn parse_method<'a>(bytes: &mut BytesMut) -> Result<&'a str> {
     const GET: [u8; 4] = *b"GET ";
     const POST: [u8; 4] = *b"POST";
     match bytes.peek_n::<[u8; 4]>(4) {
@@ -880,12 +880,12 @@ pub fn parse_method<'a>(bytes: &mut Bytes<'a>) -> Result<&'a str> {
 /// > Non-US-ASCII content in header fields and the reason phrase
 /// > has been obsoleted and made opaque (the TEXT rule was removed).
 #[inline]
-fn parse_reason<'a>(bytes: &mut Bytes<'a>) -> Result<&'a str> {
+fn parse_reason<'a>(buf: &mut BytesMut) -> Result<&'a str> {
     let mut seen_obs_text = false;
     loop {
-        let b = next!(bytes);
+        let b = next!(buf);
         if b == b'\r' {
-            expect!(bytes.next() == b'\n' => Err(Error::Status));
+            expect!(buf.next() == b'\n' => Err(Error::Status));
             return Ok(Status::Complete(
                 // SAFETY: (1) calling bytes.slice_skip(2) is safe, because at least two next! calls
                 // advance the bytes iterator.
@@ -893,10 +893,11 @@ fn parse_reason<'a>(bytes: &mut Bytes<'a>) -> Result<&'a str> {
                 // were validated to be allowed US-ASCII chars by the other arms of the if/else or
                 // otherwise `seen_obs_text` is true and an empty string is returned instead.
                 unsafe {
-                    let bytes = bytes.slice_skip(2);
+                    buf.advance(2);
+                    //let bytes = 
                     if !seen_obs_text {
                         // all bytes up till `i` must have been HTAB / SP / VCHAR
-                        str::from_utf8_unchecked(bytes)
+                        str::from_utf8_unchecked(buf)
                     } else {
                         // obs-text characters were found, so return the fallback empty string
                         ""
@@ -909,7 +910,7 @@ fn parse_reason<'a>(bytes: &mut Bytes<'a>) -> Result<&'a str> {
                 // advance the bytes iterator.
                 // (2) see (2) of safety comment above.
                 unsafe {
-                    let bytes = bytes.slice_skip(1);
+                    let bytes = buf.slice_skip(1);
                     if !seen_obs_text {
                         // all bytes up till `i` must have been HTAB / SP / VCHAR
                         str::from_utf8_unchecked(bytes)
@@ -928,21 +929,29 @@ fn parse_reason<'a>(bytes: &mut Bytes<'a>) -> Result<&'a str> {
 }
 
 #[inline]
-fn parse_token<'a>(bytes: &mut Bytes<'a>) -> Result<&'a str> {
-    let b = next!(bytes);
+fn parse_token<'a>(buf: &mut BytesMut) -> Result<&'a str> {
+    let bytes = buf.as_ref();
+    // First char must be a token char, it can't be a space which would indicate an empty token.
+    let b = peek!(bytes);
     if !is_token(b) {
-        // First char must be a token char, it can't be a space which would indicate an empty token.
         return Err(Error::Token);
     }
-
+    
+    let mut len = 1usize;
+    let mut remaining;
     loop {
-        let b = next!(bytes);
+        remaining = &bytes[len..];
+        let b = peek!(remaining);
         if b == b' ' {
+            let token = buf.split_to(len).freeze();
+            buf.advance(1);
             return Ok(Status::Complete(
                 // SAFETY: all bytes up till `i` must have been `is_token` and therefore also utf-8.
-                unsafe { str::from_utf8_unchecked(bytes.slice_skip(1)) },
+                unsafe { str::from_utf8_unchecked(token.as_ref()) },
             ));
-        } else if !is_token(b) {
+        };
+        len = len.saturating_add(1);
+        if !is_token(b) {
             return Err(Error::Token);
         }
     }
@@ -952,26 +961,26 @@ fn parse_token<'a>(bytes: &mut Bytes<'a>) -> Result<&'a str> {
 #[doc(hidden)]
 #[allow(missing_docs)]
 // WARNING: Exported for internal benchmarks, not fit for public consumption
-pub fn parse_uri<'a>(bytes: &mut Bytes<'a>) -> Result<&'a str> {
-    let start = bytes.pos();
-    simd::match_uri_vectored(bytes);
+pub fn parse_uri<'a>(bytes: &mut BytesMut) -> Result<&'a str> {
+    let uri_len = simd::match_uri_vectored(bytes);
     // URI must have at least one char
-    if bytes.pos() == start {
+    if uri_len == 0 {
         return Err(Error::Token);
     }
-
+    let uri = bytes.split_to(uri_len).freeze();
     if next!(bytes) == b' ' {
-        return Ok(Status::Complete(
+        bytes.advance(1);
+        let s =  unsafe { str::from_utf8_unchecked(&bytes) };
+        Ok(Status::Complete(s))
             // SAFETY: all bytes up till `i` must have been `is_token` and therefore also utf-8.
-            unsafe { str::from_utf8_unchecked(bytes.slice_skip(1)) },
-        ));
+    //        unsafe { str::from_utf8_unchecked(bytes.slice_skip(1)) },
     } else {
         Err(Error::Token)
     }
 }
 
 #[inline]
-fn parse_code(bytes: &mut Bytes<'_>) -> Result<u16> {
+fn parse_code(bytes: &mut BytesMut) -> Result<u16> {
     let hundreds = expect!(bytes.next() == b'0'..=b'9' => Err(Error::Status));
     let tens = expect!(bytes.next() == b'0'..=b'9' => Err(Error::Status));
     let ones = expect!(bytes.next() == b'0'..=b'9' => Err(Error::Status));
@@ -1052,7 +1061,7 @@ struct HeaderParserConfig {
  */
 fn parse_headers_iter_uninit<'a>(
     headers: &mut &mut [MaybeUninit<Header<'a>>],
-    bytes: &mut Bytes<'a>,
+    bytes: &mut BytesMut,
     config: &HeaderParserConfig
 ) -> Result<usize> {
 
@@ -1089,7 +1098,7 @@ fn parse_headers_iter_uninit<'a>(
     macro_rules! maybe_continue_after_obsolete_line_folding {
         ($bytes:ident, $label:lifetime) => {
             if config.allow_obsolete_multiline_headers {
-                match $bytes.peek() {
+                match $bytes.as_ref().get(0) {
                     None => {
                         // Next byte may be a space, in which case that header
                         // is using obsolete line folding, so we may have more
@@ -1162,14 +1171,13 @@ fn parse_headers_iter_uninit<'a>(
                 && (b == b' ' || b == b'\t')
             {
                 //advance past white space and then try parsing header again
-                while let Some(peek) = bytes.peek() {
-                    if peek == b' ' || peek == b'\t' {
+                while let Some(peek) = bytes.get(0) {
+                    if *peek == b' ' || *peek == b'\t' {
                         next!(bytes);
                     } else {
                         break;
                     }
                 }
-                bytes.slice();
                 continue 'headers;
             } else {
                 handle_invalid_char!(bytes, b, HeaderName);
@@ -1179,15 +1187,13 @@ fn parse_headers_iter_uninit<'a>(
         #[allow(clippy::never_loop)]
         // parse header name until colon
         let header_name: &str = 'name: loop {
-            simd::match_header_name_vectored(bytes);
-            let mut b = next!(bytes);
-
-            // SAFETY: previously bumped by 1 with next! -> always safe.
-            let bslice = unsafe { bytes.slice_skip(1) };
+            let name_len = simd::match_header_name_vectored(bytes);
+            let bslice = bytes.split_to(name_len).freeze();
             // SAFETY: previous call to match_header_name_vectored ensured all bytes are valid
             // header name chars, and as such also valid utf-8.
-            let name = unsafe { str::from_utf8_unchecked(bslice) };
+            let name = unsafe { str::from_utf8_unchecked(&bslice) };
 
+            let mut b = next!(bytes);
             if b == b':' {
                 break 'name name;
             }
@@ -1195,9 +1201,7 @@ fn parse_headers_iter_uninit<'a>(
             if config.allow_spaces_after_header_name {
                 while b == b' ' || b == b'\t' {
                     b = next!(bytes);
-
                     if b == b':' {
-                        bytes.slice();
                         break 'name name;
                     }
                 }
@@ -1214,7 +1218,6 @@ fn parse_headers_iter_uninit<'a>(
             'whitespace_after_colon: loop {
                 b = next!(bytes);
                 if b == b' ' || b == b'\t' {
-                    bytes.slice();
                     continue 'whitespace_after_colon;
                 }
                 if is_header_value_token(b) {
@@ -1239,7 +1242,7 @@ fn parse_headers_iter_uninit<'a>(
             'value_lines: loop {
                 // parse value till EOL
 
-                simd::match_header_value_vectored(bytes);
+                let len = simd::match_header_value_vectored(bytes);
                 let b = next!(bytes);
 
                 //found_ctl
@@ -1304,7 +1307,8 @@ fn parse_headers_iter_uninit<'a>(
 pub fn parse_chunk_size(buf: &[u8])
     -> result::Result<Status<(usize, u64)>, InvalidChunkSize> {
     const RADIX: u64 = 16;
-    let mut bytes = Bytes::new(buf);
+    let mut bytes = BytesMut::from(buf);
+    let orig_len = bytes.len();
     let mut size = 0;
     let mut in_chunk_size = true;
     let mut in_ext = false;
@@ -1376,7 +1380,8 @@ pub fn parse_chunk_size(buf: &[u8])
             _ => return Err(InvalidChunkSize),
         }
     }
-    Ok(Status::Complete((bytes.pos(), size)))
+    let pos = orig_len - bytes.len();
+    Ok(Status::Complete((pos, size)))
 }
 
 #[cfg(test)]
